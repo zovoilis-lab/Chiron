@@ -13,32 +13,57 @@ from __future__ import print_function
 import os
 import sys
 import time
-import json
 import argparse
-from distutils.dir_util import copy_tree
 
 import tensorflow as tf
 import chiron.chiron_model as model
-
-from chiron.chiron_input import read_raw_data_sets
 from chiron.chiron_input import read_tfrecord
 from chiron.chiron_input import read_cache_dataset
-from chiron.cnn import getcnnfeature
-from chiron.cnn import getcnnlogit
 from six.moves import range
-
 DEFAULT_OFFSET = 10
-def train():
-    training = tf.placeholder(tf.bool)
-    global_step = tf.get_variable('global_step', trainable=False, shape=(),
+
+from chiron.chiron_eval import sparse2dense
+from matplotlib import pyplot as plt
+
+def save_hyper_parameter():
+    """
+    TODO: Function to save the hyper parameter.
+    """
+def compile_train_graph(config,hp):
+    class net:
+        pass
+    net.training = tf.placeholder(tf.bool)
+    net.global_step = tf.get_variable('global_step', trainable=False, shape=(),
                                   dtype=tf.int32,
                                   initializer=tf.zeros_initializer())
-    x = tf.placeholder(tf.float32, shape=[FLAGS.batch_size, FLAGS.sequence_len])
-    seq_length = tf.placeholder(tf.int32, shape=[FLAGS.batch_size])
-    y_indexs = tf.placeholder(tf.int64)
-    y_values = tf.placeholder(tf.int32)
-    y_shape = tf.placeholder(tf.int64)
-    y = tf.SparseTensor(y_indexs, y_values, y_shape)
+    net.x = tf.placeholder(tf.float32, shape=[hp.batch_size, hp.sequence_len])
+    net.seq_length = tf.placeholder(tf.int32, shape=[hp.batch_size])
+    net.y_indexs = tf.placeholder(tf.int64)
+    net.y_values = tf.placeholder(tf.int32)
+    net.y_shape = tf.placeholder(tf.int64)
+    net.y = tf.SparseTensor(net.y_indexs, net.y_values, net.y_shape)
+    net.logits, net.ratio = model.inference(net.x, net.seq_length, net.training,hp.sequence_len,configure = config)
+    if 'fl_gamma' in config.keys():
+        net.ctc_loss = model.loss(net.logits, net.seq_length, net.y, fl_gamma = config['fl_gamma'])
+    else:
+        net.ctc_loss = model.loss(net.logits, net.seq_length, net.y)
+    net.opt = model.train_opt(hp.step_rate,
+                          hp.max_steps, 
+                          global_step=net.global_step,
+                          opt_name = config['opt_method'])
+    if hp.gradient_clip is None:
+        net.step = net.opt.minimize(net.ctc_loss,global_step = net.global_step)
+    else:
+        net.gradients, net.variables = zip(*net.opt.compute_gradients(net.ctc_loss))
+        net.gradients = [None if gradient is None else tf.clip_by_norm(gradient, hp.gradient_clip) for gradient in net.gradients]
+        net.step = net.opt.apply_gradients(zip(net.gradients, net.variables),global_step = net.global_step)
+    net.error,net.errors,net.y_ = model.prediction(net.logits, net.seq_length, net.y)
+    net.init = tf.global_variables_initializer()
+    net.saver = tf.train.Saver()
+    net.summary = tf.summary.merge_all()
+    return net
+
+def train():
     default_config = os.path.join(FLAGS.log_dir,FLAGS.model_name,'model.json')
     if FLAGS.retrain:
         if os.path.isfile(default_config):
@@ -48,30 +73,19 @@ def train():
     else:
         config_file = FLAGS.configure   
     config = model.read_config(config_file)
-    logits, ratio = model.inference(x, seq_length, training,FLAGS.sequence_len,configure = config)
-    if 'fl_gamma' in config.keys():
-        ctc_loss = model.loss(logits, seq_length, y, fl_gamma = config['fl_gamma'])
-    else:
-        ctc_loss = model.loss(logits, seq_length, y)
-    opt = model.train_opt(FLAGS.step_rate,
-                          FLAGS.max_steps, 
-                          global_step=global_step,
-                          opt_name = config['opt_method'])
-    step = opt.minimize(ctc_loss,global_step = global_step)
-    error = model.prediction(logits, seq_length, y)
-    init = tf.global_variables_initializer()
-    saver = tf.train.Saver()
-    summary = tf.summary.merge_all()
     print("Begin training using following setting:")
     for pro in dir(FLAGS):
         if not pro.startswith('_'):
             print("%s:%s"%(pro,getattr(FLAGS,pro)))
-    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
+    net = compile_train_graph(config,FLAGS)
+    sess = tf.Session(config=tf.ConfigProto(inter_op_parallelism_threads=FLAGS.threads,
+                                            intra_op_parallelism_threads=FLAGS.threads,
+                                            allow_soft_placement=True))
     if FLAGS.retrain == False:
-        sess.run(init)
+        sess.run(net.init)
         print("Model init finished, begin loading data. \n")
     else:
-        saver.restore(sess, tf.train.latest_checkpoint(
+        net.saver.restore(sess, tf.train.latest_checkpoint(
             FLAGS.log_dir + FLAGS.model_name))
         print("Model loaded finished, begin loading data. \n")
     summary_writer = tf.summary.FileWriter(
@@ -87,33 +101,36 @@ def train():
             train_ds,valid_ds = generate_train_valid_datasets(initial_offset = resample_n*FLAGS.offset_increment + DEFAULT_OFFSET)
         batch_x, seq_len, batch_y = train_ds.next_batch(FLAGS.batch_size)
         indxs, values, shape = batch_y
-        feed_dict = {x: batch_x, seq_length: seq_len / ratio, y_indexs: indxs,
-                     y_values: values, y_shape: shape,
-                     training: True}
-        loss_val, _ = sess.run([ctc_loss, step], feed_dict=feed_dict)
+        feed_dict = {net.x: batch_x, net.seq_length: seq_len / net.ratio, net.y_indexs: indxs,
+                     net.y_values: values, net.y_shape: shape,
+                     net.training: True}
+        loss_val, _ = sess.run([net.ctc_loss, net.step], feed_dict=feed_dict)
         if i % 10 == 0:
-            global_step_val = tf.train.global_step(sess, global_step)
+            global_step_val = tf.train.global_step(sess, net.global_step)
             valid_x, valid_len, valid_y = valid_ds.next_batch(FLAGS.batch_size)
             indxs, values, shape = valid_y
-            feed_dict = {x: valid_x, seq_length: valid_len / ratio,
-                         y_indexs: indxs, y_values: values, y_shape: shape,
-                         training: True}
-            error_val = sess.run(error, feed_dict=feed_dict)
+            feed_dict = {net.x: valid_x, net.seq_length: valid_len / net.ratio,
+                         net.y_indexs: indxs, net.y_values: values, net.y_shape: shape,
+                         net.training: True}
+            error_val = sess.run(net.error, feed_dict=feed_dict)
+#            x_val,errors_val,y_predict,y = sess.run([x,errors,y_,y],feed_dict = feed_dict)
+#            predict_seq,_ = sparse2dense([y_predict,0])
+#            true_seq,_ = sparse2dense([[y],0])
             end = time.time()
             print(
             "Step %d/%d Epoch %d, batch number %d, train_loss: %5.3f validate_edit_distance: %5.3f Elapsed Time/step: %5.3f" \
             % (i, FLAGS.max_steps, train_ds.epochs_completed,
                train_ds.index_in_epoch, loss_val, error_val,
                (end - start) / (i + 1)))
-            saver.save(sess, FLAGS.log_dir + FLAGS.model_name + '/model.ckpt',
+            net.saver.save(sess, FLAGS.log_dir + FLAGS.model_name + '/model.ckpt',
                        global_step=global_step_val)
-            summary_str = sess.run(summary, feed_dict=feed_dict)
+            summary_str = sess.run(net.summary, feed_dict=feed_dict)
             summary_writer.add_summary(summary_str, global_step=global_step_val)
             summary_writer.flush()
-    global_step_val = tf.train.global_step(sess, global_step)
+    global_step_val = tf.train.global_step(sess, net.global_step)
     print("Model %s saved." % (FLAGS.log_dir + FLAGS.model_name))
     print("Reads number %d" % (train_ds.reads_n))
-    saver.save(sess, FLAGS.log_dir + FLAGS.model_name + '/final.ckpt',
+    net.saver.save(sess, FLAGS.log_dir + FLAGS.model_name + '/final.ckpt',
                global_step=global_step_val)
     
 def generate_train_valid_datasets(initial_offset = 10):
@@ -150,6 +167,10 @@ def generate_train_valid_datasets(initial_offset = 10):
 def run(args):
     global FLAGS
     FLAGS = args
+    if FLAGS.train_cache is None:
+        FLAGS.train_cache = FLAGS.data_dir + '/train_cache.hdf5'
+    if (FLAGS.valid_cache is None) and (FLAGS.validation is not None):
+        FLAGS.valid_cache = FLAGS.data_dir + '/valid_cache.hdf5'
     FLAGS.data_dir = FLAGS.data_dir + os.path.sep
     FLAGS.log_dir = FLAGS.log_dir + os.path.sep
     train()
@@ -174,7 +195,7 @@ if __name__ == "__main__":
                         help='the length of sequence')
     parser.add_argument('-b', '--batch_size', type=int, default=300,
                         help='Batch size')
-    parser.add_argument('-t', '--step_rate', type=float, default=1e-2,
+    parser.add_argument('-t', '--step_rate', type=float, default=4e-3,
                         help='Step rate')
     parser.add_argument('-x', '--max_steps', type=int, default=10000,
                         help='Maximum step')
@@ -187,18 +208,22 @@ if __name__ == "__main__":
                         type = int,
                         default = 0, 
                         help='Resample the reads data every n epoches, with an increasing initial offset.')
+    parser.add_argument('--threads',
+                        type = int,
+                        default = 0, 
+                        help='The threads that available, if 0 use all threads that can be found.')
     parser.add_argument('--offset_increment',
                         type = int,
                         default = 3,
                         help='The increament of initial offset if the resample_after_epoch has been set.')
+    parser.add_argument('--gradient_clip',
+                        type = float,
+                        default = None,
+                        help = 'Clip the gradient by the gradient_clip x normalization, a good estimate is 5.')
     parser.add_argument('--retrain', dest='retrain', action='store_true',
                         help='Set retrain to true')
     parser.add_argument('--read_cache',dest='read_cache',action='store_true',
                         help="Read from cached hdf5 file.")
     parser.set_defaults(retrain=False)
     args = parser.parse_args(sys.argv[1:])
-    if args.train_cache is None:
-        args.train_cache = args.data_dir + '/train_cache.hdf5'
-    if (args.valid_cache is None) and (args.validation is not None):
-        args.valid_cache = args.data_dir + '/valid_cache.hdf5'
     run(args)

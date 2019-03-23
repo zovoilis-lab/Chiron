@@ -23,6 +23,7 @@ from chiron.cnn import getcnnlogit
 from chiron.rnn import rnn_layers
 from chiron.utils.easy_assembler import simple_assembly
 from chiron.utils.easy_assembler import simple_assembly_qs
+from chiron.utils.easy_assembler import global_alignment_assembly
 from chiron.utils.unix_time import unix_time
 from chiron.utils.progress import multi_pbars
 from six.moves import range
@@ -101,6 +102,18 @@ def path_prob(logits):
     prob_logits = tf.reduce_mean(logits_diff, axis=-2)
     return prob_logits
 
+def get_assembler_kernal(jump, segment_len):
+    """
+    Args:
+        jump: jump size
+        segment_len: length of segment
+    """
+    assembler='global'
+    if jump > 0.9*segment_len:
+        assembler='glue'
+    if jump >= segment_len:
+        assembler='stick'
+    return assembler
 
 def qs(consensus, consensus_qs, output_standard='phred+33'):
     """Calculate the quality score for the consensus read.
@@ -265,10 +278,12 @@ def evaluation():
                     feed_dict = {
                         x: batch_x,
                         seq_length: np.round(seq_len/ratio).astype(np.int32),
-                        training: False,
+                        training: True,
                         logits_index:i,
                         logits_fname: name,
                     }
+                    #Training: True for a temporary fix of the batch normalization problem: https://github.com/haotianteng/Chiron/commit/8fce3a3b4dac8e9027396bb8c9152b7b5af953ce
+                    #TODO: change the training FLAG back to False after the new model has been trained.
                     sess.run(logits_enqueue,feed_dict=feed_dict)
                     pbars.update(0,progress=i+FLAGS.batch_size)
                     pbars.update_bar()
@@ -300,7 +315,6 @@ def evaluation():
             pbars.update_bar()
             reading_time = time.time() - start_time
             reads = list()
-
             N = len(range(0, reads_n, FLAGS.batch_size))
             while True:
                 l_sz, d_sz = sess.run([logits_queue_size, decode_queue_size])
@@ -333,14 +347,15 @@ def evaluation():
                     qs_list = np.concatenate((qs_list, logits_prob))
                 reads += predict_read
             val.pop(name)  # Release the memory
-
             basecall_time = time.time() - start_time
             bpreads = [index2base(read) for read in reads]
+            js_ratio = FLAGS.jump/FLAGS.segment_len
+            kernal = get_assembler_kernal(FLAGS.jump,FLAGS.segment_len)
             if FLAGS.extension == 'fastq':
-                consensus, qs_consensus = simple_assembly_qs(bpreads, qs_list)
+                consensus, qs_consensus = simple_assembly_qs(bpreads, qs_list,js_ratio,kernal=kernal)
                 qs_string = qs(consensus, qs_consensus)
             else:
-                consensus = simple_assembly(bpreads)
+                consensus = simple_assembly(bpreads,js_ratio,kernal=kernal)
             c_bpread = index2base(np.argmax(consensus, axis=0))
             assembly_time = time.time() - start_time
             list_of_time = [start_time, reading_time,
@@ -348,7 +363,6 @@ def evaluation():
             write_output(bpreads, c_bpread, list_of_time, file_pre, concise=FLAGS.concise, suffix=FLAGS.extension,
                          q_score=qs_string,global_setting=FLAGS)
     pbars.end()
-
 
 def decoding_queue(logits_queue, num_threads=6):
     q_logits, q_name, q_index, seq_length = logits_queue.dequeue()

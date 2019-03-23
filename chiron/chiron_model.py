@@ -64,6 +64,7 @@ def loss(logits, seq_len, label, fl_gamma = 0):
             loss = tf.math.pow(1-tf.math.exp(-loss),fl_gamma)*loss
         else:
             loss = tf.pow(1-tf.exp(-loss),fl_gamma)*loss
+#    tf.summary.histogram('loss_histogram', loss)
     loss = tf.reduce_mean(loss)
     tf.add_to_collection('losses',loss)
     """Note here ctc_loss will perform softmax, so no need to softmax the logits."""
@@ -126,7 +127,7 @@ def prediction(logits, seq_length, label,beam_width = 30, top_paths=1):
     d_min = tf.reduce_min(edit_d, axis=0)
     error = tf.reduce_mean(d_min, axis=0)
     tf.summary.scalar('Error_rate', error)
-    return error
+    return error,d_min,predict
 
 def inference(x,sequence_len,training,full_sequence_len,configure, apply_ratio = False):
     """Infer a logits of the input signal batch.
@@ -142,7 +143,7 @@ def inference(x,sequence_len,training,full_sequence_len,configure, apply_ratio =
         logits: Tensor of shape [batch_size, max_time, class_num]
         ratio: Scalar float, the scale factor between the output logits and the input maximum length.
     """
-    cnn_feature = getcnnfeature(x,training = training,cnn_config = configure['cnn']['model'])
+    cnn_feature = getcnnfeature(x,training = training,cnn_config = configure['cnn'])
     feashape = cnn_feature.get_shape().as_list()
     ratio = full_sequence_len/feashape[1]
     if apply_ratio:
